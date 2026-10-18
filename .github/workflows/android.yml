@@ -1,1 +1,109 @@
+# Builds the Android app on GitHub's servers — no computer needed.
+# Run it from the phone: repository → Actions → "Build Android app" → Run workflow.
+#   task = build        → a test APK to install on your phone (+ a signed .aab for Google Play once the key exists)
+#   task = create-key   → creates your upload key once and stores it in this private repository
+# The project can be in the repository itself, or uploaded as one file: paper-panic-project.zip
+name: Build Android app
 
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "build or create-key"
+        type: choice
+        options: [build, create-key]
+        default: build
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the project if it was uploaded as a zip
+        run: |
+          if [ -f paper-panic-project.zip ]; then
+            unzip -o -q paper-panic-project.zip
+          fi
+          test -f package.json || { echo "::error::Upload paper-panic-project.zip (or the project files) to the repository first."; exit 1; }
+
+      # ---------- one-time: create the upload key ----------
+      - name: Create the upload key (only when task = create-key)
+        if: github.event_name == 'workflow_dispatch' && inputs.task == 'create-key'
+        run: |
+          if [ -z "$KEYSTORE_PASSWORD" ]; then echo "::error::Add the secret KEYSTORE_PASSWORD first (Settings → Secrets and variables → Actions)."; exit 1; fi
+          if [ -f android-signing/upload-keystore.jks ]; then echo "::error::A key already exists. Never replace it: Google Play needs the same key for every update."; exit 1; fi
+          mkdir -p android-signing
+          keytool -genkeypair -v -keystore android-signing/upload-keystore.jks -alias upload -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" -dname "CN=Paper Panic, O=Paper Panic, C=DZ"
+          git config user.name "github-actions"; git config user.email "actions@github.com"
+          git add android-signing/upload-keystore.jks
+          git commit -m "Add upload key (password kept in repository secrets)"
+          git push
+      - name: Keep a backup copy of the key
+        if: github.event_name == 'workflow_dispatch' && inputs.task == 'create-key'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-key-BACKUP-KEEP-SAFE
+          path: android-signing/upload-keystore.jks
+          retention-days: 30
+
+      # ---------- build ----------
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'push' || inputs.task == 'build'
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        if: github.event_name == 'push' || inputs.task == 'build'
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+        if: github.event_name == 'push' || inputs.task == 'build'
+        with:
+          # the old "tools" package no longer exists in the new SDK command-line tools
+          packages: platform-tools
+
+      - name: Prepare the Android project
+        if: github.event_name == 'push' || inputs.task == 'build'
+        run: |
+          npm ci || npm install
+          rm -rf android
+          npx cap add android
+          npx capacitor-assets generate --android
+          if [ -f android-signing/upload-keystore.jks ] && [ -n "$KEYSTORE_PASSWORD" ]; then export KEYSTORE_FILE="$PWD/android-signing/upload-keystore.jks"; fi
+          VERSION_CODE=${{ github.run_number }} KEYSTORE_FILE=${KEYSTORE_FILE:-} node scripts/configure-android.mjs
+          npx cap sync android
+          chmod +x android/gradlew
+
+      - name: Build test APK
+        if: github.event_name == 'push' || inputs.task == 'build'
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Build signed bundle for Google Play
+        if: (github.event_name == 'push' || inputs.task == 'build') && hashFiles('android-signing/upload-keystore.jks') != '' && env.KEYSTORE_PASSWORD != ''
+        working-directory: android
+        env:
+          KEYSTORE_FILE: ${{ github.workspace }}/android-signing/upload-keystore.jks
+        run: ./gradlew bundleRelease --no-daemon
+
+      - name: Download — test APK (install on your phone)
+        if: github.event_name == 'push' || inputs.task == 'build'
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-panic-test-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+      - name: Download — Google Play bundle (.aab)
+        if: (github.event_name == 'push' || inputs.task == 'build') && hashFiles('android/app/build/outputs/bundle/release/*.aab') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-panic-google-play-aab
+          path: android/app/build/outputs/bundle/release/*.aab
