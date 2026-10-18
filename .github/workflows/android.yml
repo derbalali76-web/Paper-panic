@@ -95,6 +95,29 @@ jobs:
           KEYSTORE_FILE: ${{ github.workspace }}/android-signing/upload-keystore.jks
         run: ./gradlew bundleRelease --no-daemon
 
+      # Rename the APK so the Release asset has a friendly, versioned filename
+      - name: Rename APK
+        if: github.event_name == 'push' || inputs.task == 'build'
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk paper-panic-v${{ github.run_number }}.apk
+          if [ -f android/app/build/outputs/bundle/release/app-release.aab ]; then
+            cp android/app/build/outputs/bundle/release/app-release.aab paper-panic-v${{ github.run_number }}.aab
+          fi
+
+      # Publish the plain .apk to a GitHub Release — tap-to-install, no zip wrapper
+      - name: Publish APK to Releases
+        if: github.event_name == 'push' || inputs.task == 'build'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Paper Panic v${{ github.run_number }}
+          body: |
+            Build #${{ github.run_number }} — download the .apk below and tap it on your Android device to install.
+          files: |
+            paper-panic-v${{ github.run_number }}.apk
+            paper-panic-v${{ github.run_number }}.aab
+
+      # Also keep the Artifacts (zipped by GitHub) as a fallback
       - name: Download — test APK (install on your phone)
         if: github.event_name == 'push' || inputs.task == 'build'
         uses: actions/upload-artifact@v4
